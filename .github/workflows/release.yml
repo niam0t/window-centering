@@ -1,74 +1,277 @@
+# =============================================================================
+# Release workflow for the "window-centering" GNOME Shell extension
+#
+# Responsibilities:
+#   1. On every push to `main`  → build the extension zip and publish it as a
+#      PRE-RELEASE tagged `pre-<next_major>.<increment>` (e.g. pre-5.0, pre-5.1…)
+#   2. On every published GitHub Release → build the extension zip and ATTACH
+#      it to that existing release as an asset (no new release is created).
+#
+# "next_major" is derived from `metadata.json`'s `version` field:
+#   - If metadata.json has version: 4 → pre-releases are pre-5.0, pre-5.1, …
+#   - When you publish a final v5 release and bump metadata.json to 5,
+#     the next pre-release series automatically becomes pre-6.0, pre-6.1, …
+#
+# See the "Edit guide" at the bottom of this file for project-specific tweaks.
+# =============================================================================
+
 name: Release
 
+# -----------------------------------------------------------------------------
+# Triggers
+# -----------------------------------------------------------------------------
 on:
-  push:
-    branches: [ main ]                 # pre-release on every commit to main
-  release:
-    types: [ published ]               # attach zip when a final release is published
-  workflow_dispatch:                   # manual trigger (for testing the pre-release path)
+# Build + publish a pre-release for every commit landing on main.
+# (Change `main` here if your default branch is named differently.)
+push:
+branches: [ main ]
 
+# When you click "Publish release" on GitHub, attach the freshly built
+# zip to that release. This does NOT create a release — it only uploads
+# the asset, so the release you drafted/published stays the source of truth.
+release:
+types: [ published ]
+
+# Manual trigger from the Actions tab. Useful for testing the pre-release
+# path without pushing a commit. `gh workflow run Release` also works.
+workflow_dispatch:
+
+# -----------------------------------------------------------------------------
+# Permissions
+# -----------------------------------------------------------------------------
+# `contents: write` is required by softprops/action-gh-release to create
+# releases and upload assets. GitHub's default GITHUB_TOKEN has this
+# capability, but only when explicitly granted here.
 permissions:
-  contents: write                      # required to create releases & upload assets
+contents: write
+
+# -----------------------------------------------------------------------------
+# Concurrency
+# -----------------------------------------------------------------------------
+# Serialise pre-release jobs per branch so that two quick pushes don't both
+# read the same "last tag" and end up creating duplicate increment numbers.
+# `cancel-in-progress: false` lets the currently-running job finish rather
+# than aborting mid-upload.
+concurrency:
+group: pre-release-${{ github.ref }}
+cancel-in-progress: false
 
 jobs:
-  pre-release:
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+# ===========================================================================
+# JOB: pre-release
+# ===========================================================================
+# Runs on every push to `main` and on manual dispatch.
+# Builds the extension and publishes it under a `pre-X.Y` tag.
+# ===========================================================================
+pre-release:
+if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+runs-on: ubuntu-latest
+steps:
+# Fetch the repository at the triggering commit.
+# `actions/checkout@v4` brings the full working tree including
+# `schemas/` and `lib/` — nothing extra is needed for this project.
+- name: Checkout
+uses: actions/checkout@v4
 
-      - name: Install GLib tools
-        run: sudo apt-get update && sudo apt-get install -y libglib2.0-bin
+# glib-compile-schemas ships with libglib2.0-bin. It is normally present
+# on ubuntu-latest, but installing explicitly guarantees the schema
+# compilation step below cannot fail on a slim runner image.
+- name: Install GLib tools
+run: sudo apt-get update && sudo apt-get install -y libglib2.0-bin
 
-      - name: Compile GNOME schemas
-        run: glib-compile-schemas schemas
+# GNOME Shell reads GSettings from a compiled binary (`gschemas.compiled`),
+# not from the raw XML. This regenerates it from the current source so
+# the shipped zip is always in sync with the .gschema.xml file.
+- name: Compile GNOME schemas
+run: glib-compile-schemas schemas
 
-      - name: Create extension zip
-        run: |
-          zip -r "window-centering@niam0t.zip" \
-            metadata.json \
-            extension.js \
-            prefs.js \
-            schemas \
-            lib
+# Build the extension zip. The file list intentionally includes ONLY the
+# runtime essentials (no .git, no CI files, no README/LICENSE/CHANGELOG).
+# -r makes `schemas` and `lib` recurse.
+#
+# ▸ If you add new top-level files/folders that must ship with the
+#   extension, add them to this list AND to the identical list in the
+#   final-release job below.
+- name: Create extension zip
+run: |
+zip -r "window-centering@niam0t.zip" \
+	    metadata.json \
+	    extension.js \
+	    prefs.js \
+	    schemas \
+	    lib
 
-      - name: Create pre-release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: pre-${{ github.sha }}
-          name: Pre-release ${{ github.sha }}
-          prerelease: true
-          files: window-centering@niam0t.zip
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+# -----------------------------------------------------------------------
+# Compute the pre-release tag: pre-<next_major>.<increment>
+#
+# Algorithm:
+#   1. Read `version` from metadata.json (e.g. 4).
+#   2. target_major = version + 1        (e.g. 5).
+#   3. List all existing pre-release tags matching `pre-<target_major>.*`.
+#   4. If none exist → increment = 0.
+#      Otherwise    → take the highest existing increment + 1.
+#   5. Tag = `pre-<target_major>.<increment>`.
+#
+# Using `sort -V` handles multi-digit increments correctly
+# (pre-5.9 < pre-5.10). The `|| true` prevents `grep` from failing
+# when the list is empty (grep exits 1 on no match, which would
+# otherwise abort the step).
+# -----------------------------------------------------------------------
+	    - name: Compute pre-release tag
+	    id: tag
+	    env:
+GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+run: |
+	VERSION=$(jq -r '.version' metadata.json)
+TARGET_MAJOR=$((VERSION + 1))
+	echo "target_major=$TARGET_MAJOR" >> "$GITHUB_OUTPUT"
 
-  final-release:
-    if: github.event_name == 'release'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+	EXISTING=$(gh release list --limit 100 --json tagName,isPrerelease \
+			--jq '.[] | select(.isPrerelease) | .tagName' \
+			| grep "^pre-${TARGET_MAJOR}\." || true)
 
-      - name: Install GLib tools
-        run: sudo apt-get update && sudo apt-get install -y libglib2.0-bin
+	if [ -z "$EXISTING" ]; then
+	NEXT=0
+	else
+	HIGHEST=$(echo "$EXISTING" | sort -V | tail -n1)
+	CURRENT_NUM=${HIGHEST##*.}
+NEXT=$((CURRENT_NUM + 1))
+	fi
 
-      - name: Compile GNOME schemas
-        run: glib-compile-schemas schemas
+	TAG="pre-${TARGET_MAJOR}.${NEXT}"
+	echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+	echo "Creating pre-release with tag: $TAG"
 
-      - name: Create extension zip
-        run: |
-          zip -r "window-centering@niam0t.zip" \
-            metadata.json \
-            extension.js \
-            prefs.js \
-            schemas \
-            lib
+# Publish the zip under the tag computed above, marked as a pre-release
+# so it never becomes the repo's "Latest release". If a release with
+# this exact tag already exists (rare with the counter scheme, but
+# possible on a re-run), the action updates it in place.
+	- name: Create pre-release
+	uses: softprops/action-gh-release@v2
+	with:
+tag_name: ${{ steps.tag.outputs.tag }}
+name: Pre-release ${{ steps.tag.outputs.tag }}
+prerelease: true
+files: window-centering@niam0t.zip
+env:
+GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Upload to existing release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.event.release.tag_name }}
-          files: window-centering@niam0t.zip
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+# ===========================================================================
+# JOB: final-release
+# ===========================================================================
+# Runs only when you publish a GitHub Release.
+# Rebuilds the extension from the release's tag and attaches the zip as
+# an asset to that release. It never creates a new release — the one you
+# published in the UI is the single source of truth.
+# ===========================================================================
+final-release:
+if: github.event_name == 'release'
+runs-on: ubuntu-latest
+steps:
+# By default, actions/checkout checks out the tagged commit that
+# triggered the release event, so the asset matches the published tag.
+- name: Checkout
+uses: actions/checkout@v4
+
+- name: Install GLib tools
+run: sudo apt-get update && sudo apt-get install -y libglib2.0-bin
+
+- name: Compile GNOME schemas
+run: glib-compile-schemas schemas
+
+# Identical to the pre-release zip. Keep these two lists in sync —
+# see the edit guide below.
+- name: Create extension zip
+run: |
+zip -r "window-centering@niam0t.zip" \
+	    metadata.json \
+	    extension.js \
+	    prefs.js \
+	    schemas \
+	    lib
+
+# `tag_name` here points at the existing release (github.event.release.tag_name),
+# so `action-gh-release` treats this as an "update existing release"
+# and only uploads the asset.
+	    - name: Upload to existing release
+	    uses: softprops/action-gh-release@v2
+	    with:
+tag_name: ${{ github.event.release.tag_name }}
+files: window-centering@niam0t.zip
+env:
+GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+
+# ## Edit guide — what to change for this or any other project
+# 
+# ### A. Project‑specific values (must stay in sync)
+# 
+# These appear in **two places** (the `pre-release` and `final-release` jobs). Change them in **both**:
+# 
+# | Value | Where | Current value | Change if… |
+# | --- | --- | --- | --- |
+# | Zip filename | `Create extension zip` step, both jobs | `window-centering@niam0t.zip` | You rename the extension or want a different asset name. Must match the `uuid` in `metadata.json` for `gnome-extensions install` to work cleanly. |
+# | Files to include | `zip -r …` arg list | `metadata.json extension.js prefs.js schemas lib` | You add new top‑level files needed at runtime (e.g. `stylesheet.css`, a `locale/` folder). **Do not** add `README.md`, `LICENSE`, `.github/`, or anything not needed by GNOME Shell. |
+# | Schema directory | `glib-compile-schemas schemas` | `schemas` | Your schemas live in a non‑standard folder. |
+# 
+# **Tip:** to keep the two zip lists from drifting, you can consolidate them into one step using a shell variable, but for two jobs it's easier to just keep them identical and review both whenever you edit.
+# 
+# ### B. Version bumping process
+# 
+# The workflow **never modifies `metadata.json`**. The release series is driven entirely by that file, so bump it deliberately:
+# 
+# 1. **Normal development:** leave `metadata.json`'s `version` alone. Every push to `main` produces `pre-(version+1).0`, `.1`, `.2`…
+# 2. **Cutting a final release:**
+#    - Publish a GitHub Release (e.g. tag `v5`) targeting `main`.
+#    - The `final-release` job fires automatically and attaches the zip to it.
+#    - **Then** open a PR bumping `metadata.json` to `"version": 5`.
+#    - After that PR lands on `main`, the next pre‑release series starts at `pre-6.0`.
+# 3. **Do not bump `version` before publishing the release** — otherwise the pre‑release series jumps early and the final release doesn't line up with the previous pre‑release numbers.
+# 
+# > If your project uses `version-name` alongside `version` in `metadata.json`, remember to bump both when publishing a final release.
+# 
+# ### C. Triggers / branches
+# 
+# - **Different default branch?** Change `branches: [ main ]` under `on.push`.
+# - **Don't want a pre-release on every commit?** Replace `branches: [ main ]` with e.g. `branches: [ prerelease ]` and push there when you want a build.
+# - **Want tag‑push releases too?** Add:
+#   ```yaml
+#   on:
+#     push:
+#       tags: [ 'v*' ]
+#   ```
+#   and add a third job (or extend `final-release`'s `if:`) that creates the release itself with `tag_name: ${{ github.ref_name }}` and `prerelease: false`.
+# 
+# ### D. Output style / behaviour
+# 
+# - **Rolling pre-release instead of numbered?** Replace `pre-<major>.<n>` with a fixed tag (e.g. `latest-pre`). The workflow then updates that one release in place — but the increment logic becomes unnecessary.
+# - **Keep old pre-releases short?** Append this step after `Create pre-release`:
+#   ```yaml
+#   - name: Prune old pre-releases (keep 10)
+#     env:
+#       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+#     run: |
+#       gh release list --limit 100 --json tagName,isPrerelease \
+#         --jq '.[] | select(.isPrerelease) | .tagName' \
+#         | sort -Vr | tail -n +11 \
+#         | xargs -r -n1 gh release delete --yes
+#   ```
+# - **Attach more assets (e.g. source tarball)?** Add more lines to `files:` — each line is a separate glob/path (newline‑separated).
+# 
+# ### E. Failure modes to be aware of
+# 
+# | Symptom | Cause | Fix |
+# | --- | --- | --- |
+# | Two pushes in quick succession both compute the same `pre-X.Y` | `concurrency` block missing or `gh release list` returned stale data | The `concurrency` block above prevents this. If you removed it, re‑add it. |
+# | `grep: no match` fails the step | `grep` exits 1 when nothing matches | The `\|\| true` after `grep` handles this — don't remove it. |
+# | `sort -V` picks `pre-5.10` over `pre-5.9` incorrectly | Only an issue on `sort` versions without `-V` | `ubuntu-latest` supports `-V`; if you change `runs-on`, verify. |
+# | `final-release` job skipped | You pushed a tag instead of clicking "Publish release" | `release: published` fires only for actual Release objects, not raw tags. |
+# | Attachment appears on the *wrong* release | Two releases share the tag (unlikely on GitHub — tags are unique) | Delete the duplicate tag/release. |
+# 
+# ### F. Testing checklist
+# 
+# 1. **Pre‑release path:** push any commit to `main` (or run `workflow_dispatch`). Confirm a new release tagged `pre-(version+1).0` appears, marked *Pre-release*, with the zip attached.
+# 2. **Increment works:** push again. Confirm the next tag is `pre-(version+1).1`.
+# 3. **Final‑release path:** draft and publish a GitHub Release (e.g. `v5`). Confirm the zip attaches to it — no new release is created.
+# 4. **Series rolls over:** bump `metadata.json` to `5` on `main`, push. The next pre‑release should be `pre-6.0`.
+# 5. **Zip sanity:** download any produced zip and run `unzip -l` — it should include `metadata.json`, `extension.js`, `prefs.js`, `schemas/…gschema.xml`, `schemas/gschemas.compiled`, and everything under `lib/`.
