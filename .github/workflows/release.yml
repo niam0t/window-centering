@@ -1,0 +1,74 @@
+name: Release
+
+on:
+  push:
+    branches: [ main ]                 # pre-release on every commit to main
+  release:
+    types: [ published ]               # attach zip when a final release is published
+  workflow_dispatch:                   # manual trigger (for testing the pre-release path)
+
+permissions:
+  contents: write                      # required to create releases & upload assets
+
+jobs:
+  pre-release:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install GLib tools
+        run: sudo apt-get update && sudo apt-get install -y libglib2.0-bin
+
+      - name: Compile GNOME schemas
+        run: glib-compile-schemas schemas
+
+      - name: Create extension zip
+        run: |
+          zip -r "window-centering@niam0t.zip" \
+            metadata.json \
+            extension.js \
+            prefs.js \
+            schemas \
+            lib
+
+      - name: Create pre-release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: pre-${{ github.sha }}
+          name: Pre-release ${{ github.sha }}
+          prerelease: true
+          files: window-centering@niam0t.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  final-release:
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install GLib tools
+        run: sudo apt-get update && sudo apt-get install -y libglib2.0-bin
+
+      - name: Compile GNOME schemas
+        run: glib-compile-schemas schemas
+
+      - name: Create extension zip
+        run: |
+          zip -r "window-centering@niam0t.zip" \
+            metadata.json \
+            extension.js \
+            prefs.js \
+            schemas \
+            lib
+
+      - name: Upload to existing release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.release.tag_name }}
+          files: window-centering@niam0t.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
