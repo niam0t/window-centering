@@ -1,9 +1,15 @@
 {
-    "uuid": "window-centering@niam0t",
-    "name": "Window Centering Plus",
-    "description": "Utilizes a shortcut to center the window on the screen and set its size to a percentage of the current screen resolution.",
-    "shell-version": ["45", "46", "47", "48", "49", "50", "51"],
-    "url": "https://github.com/niam0t/window-centering",
-    "version": 4,
-    "settings-schema": "org.gnome.shell.extensions.window-centering"
+  "uuid": "window-centering@niam0t",
+  "name": "Window Centering Plus",
+  "description": "Utilizes a shortcut to center the window on the screen and set its size to a percentage of the current screen resolution.",
+  "shell-version": [
+    "45",
+    "46",
+    "47",
+    "48",
+    "50"
+  ],
+  "url": "https://github.com/niam0t/window-centering",
+  "version": 4,
+  "settings-schema": "org.gnome.shell.extensions.window-centering"
 }

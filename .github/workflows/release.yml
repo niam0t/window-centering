@@ -108,6 +108,10 @@ jobs:
       # ▸ If you add new top-level files/folders that must ship with the
       #   extension, add them to this list AND to the identical list in the
       #   final-release job below.
+
+      - name: Remove any pre-compiled schemas
+        run: rm -f schemas/gschemas.compiled
+
       - name: Create extension zip
         run: |
           zip -r "window-centering@niam0t.zip" \
